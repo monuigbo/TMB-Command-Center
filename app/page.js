@@ -1293,11 +1293,17 @@ export default function Home() {
   // Auth: check session on mount + listen for changes
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
-      setUser(session?.user || null);
+      // Reject anonymous sessions — only allow real email/password users
+      const realUser = session?.user && session.user.is_anonymous !== true ? session.user : null;
+      setUser(realUser);
+      setAuthLoading(false);
+    }).catch(() => {
+      setUser(null);
       setAuthLoading(false);
     });
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      setUser(session?.user || null);
+      const realUser = session?.user && session.user.is_anonymous !== true ? session.user : null;
+      setUser(realUser);
     });
     return () => subscription.unsubscribe();
   }, []);
@@ -1600,6 +1606,22 @@ export default function Home() {
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              onClick={signOut}
+              style={{
+                background: "transparent",
+                border: "1px solid #E8ECF0",
+                borderRadius: 6,
+                cursor: "pointer",
+                fontSize: 11,
+                fontWeight: 600,
+                color: C.textMuted,
+                padding: "4px 10px",
+              }}
+              title="Sign Out"
+            >
+              Sign Out
+            </button>
             <button
               onClick={() => setShowDataPanel((p) => !p)}
               style={{
