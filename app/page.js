@@ -1,5 +1,8 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { supabase } from "../lib/supabase";
+import { loadFromSupabase, migrateToSupabase, createDebouncedSync } from "../lib/sync";
+import LoginScreen from "../components/LoginScreen";
 
 // ============================================
 // TMB COMMAND CENTER v3
@@ -64,6 +67,8 @@ function fmtTime(d) {
 
 // -- Storage --
 const STORE_KEY = "tmb_cc_v3";
+const STORE_KEY_BACKUP = "tmb_cc_v3_backup";
+const DATA_VERSION = 1;
 const DEFAULT_STATE = {
   leads: [],
   tasks: [],
@@ -73,21 +78,111 @@ const DEFAULT_STATE = {
   settings: { dailyTarget: 5 },
 };
 
-function loadState() {
-  if (typeof window === "undefined") return DEFAULT_STATE;
-  try {
-    const raw = localStorage.getItem(STORE_KEY);
-    return raw ? { ...DEFAULT_STATE, ...JSON.parse(raw) } : DEFAULT_STATE;
-  } catch {
-    return DEFAULT_STATE;
+function validateState(s) {
+  if (!s || typeof s !== "object") return false;
+  const requiredArrays = ["leads", "tasks", "prospectingLog", "aiConversations", "callLists"];
+  for (const key of requiredArrays) {
+    if (!Array.isArray(s[key])) return false;
   }
+  if (typeof s.settings !== "object" || s.settings === null) return false;
+  return true;
+}
+
+function migrateState(data, fromVersion) {
+  let migrated = { ...data };
+  // Future migrations: if (fromVersion < 2) { migrated = migrateV1toV2(migrated); }
+  migrated._dataVersion = DATA_VERSION;
+  return migrated;
+}
+
+function loadState() {
+  if (typeof window === "undefined") return { state: DEFAULT_STATE, source: "default", warning: null };
+
+  function tryParse(key) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  let data = tryParse(STORE_KEY);
+  let source = "primary";
+
+  if (!data || !validateState(data)) {
+    data = tryParse(STORE_KEY_BACKUP);
+    source = data && validateState(data) ? "backup" : "default";
+  }
+
+  if (source === "default") {
+    return { state: DEFAULT_STATE, source: "default", warning: null };
+  }
+
+  const version = data._dataVersion || 0;
+  if (version < DATA_VERSION) {
+    data = migrateState(data, version);
+  }
+
+  const { _dataVersion, _savedAt, ...cleanState } = data;
+  const merged = { ...DEFAULT_STATE, ...cleanState };
+
+  const warning = source === "backup"
+    ? "Primary save was corrupted. Recovered from backup — some recent changes may be missing."
+    : null;
+
+  return { state: merged, source, warning };
 }
 
 function saveState(s) {
-  if (typeof window === "undefined") return;
+  if (typeof window === "undefined") return { ok: true };
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(s));
-  } catch {}
+    const payload = JSON.stringify({ ...s, _dataVersion: DATA_VERSION, _savedAt: new Date().toISOString() });
+    localStorage.setItem(STORE_KEY, payload);
+    try { localStorage.setItem(STORE_KEY_BACKUP, payload); } catch {}
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e.message || "Save failed" };
+  }
+}
+
+function exportAllData(state) {
+  const payload = {
+    ...state,
+    _dataVersion: DATA_VERSION,
+    _exportedAt: new Date().toISOString(),
+    _app: "TMB Command Center v3",
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `tmb-backup-${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importAllData(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (!validateState(data)) {
+          reject(new Error("Invalid backup file format"));
+          return;
+        }
+        const { _dataVersion, _savedAt, _exportedAt, _app, ...cleanState } = data;
+        resolve({ ...DEFAULT_STATE, ...cleanState });
+      } catch {
+        reject(new Error("Could not parse backup file"));
+      }
+    };
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.readAsText(file);
+  });
 }
 
 // -- GHL Contact Factory --
@@ -201,11 +296,38 @@ function buildSystemPrompt(state) {
     .map((t) => `- ${t.text}${t.linkedLead ? ` [${t.linkedLead}]` : ""}`)
     .join("\n");
 
-  return `You are Michael's AI business partner and prospecting coach for The Marketing Block (TMB), a digital marketing agency in Tampa/St. Pete that builds automated revenue systems for local service businesses (contractors, home services, MedSpas, etc).
+  return `You are Michael's AI business partner, operator coach, and accountability engine for The Marketing Block (TMB), a digital marketing agency in Tampa/St. Pete that builds automated revenue systems for local service businesses (contractors, home services, MedSpas, etc).
 
-PERSONALITY: Direct. No fluff. Push Michael toward prospecting when he's slacking. Celebrate wins briefly then "what's next". 2-4 paragraphs max. Mobile-first.
+CORE PHILOSOPHY — EMBODIMENT BEFORE EVIDENCE:
+Michael already knows who he needs to become. Your job is to close the gap between knowing and doing. Every response must operate from this truth: he does not get to wait for momentum, motivation, permission, or proof before acting like the operator he says he wants to be. He moves first. Reality catches up.
 
-WHEN MICHAEL VOICE-DUMPS A PROSPECT INTERACTION, respond conversationally then append JSON:
+Do not coach the version of Michael that is "thinking about it." Coach the version that has already decided.
+
+PERSONALITY & STYLE:
+- Blunt, direct, execution-focused. No fluff, no sugarcoating, no motivational filler.
+- When he's drifting, scattered, or reactive — name it immediately and redirect to the next concrete move.
+- When he finishes something, acknowledge it briefly then ask: "What's next?"
+- Prioritize under pressure. Always reorganize his focus into: high-risk (money + reputation on the line), high-leverage (growth opportunities), low-priority (park it, don't ignore it).
+- Reframe him from "doing tasks" to "running systems that produce outcomes." From "building things" to "delivering completed results clients can feel."
+- 2-4 paragraphs max. Mobile-first. No essays.
+
+OPERATOR STANDARDS YOU ENFORCE:
+- Finish > Start. Do not let him open new threads when current ones are incomplete.
+- Visible progress builds trust. Clients need to feel movement, not hear about plans.
+- Daily wins compound. One completed action today beats three planned for tomorrow.
+- Simple systems that scale. Avoid complexity. Focus on what actually gets used and what prevents leads or clients from slipping through.
+- Stop tolerating sloppiness. Higher energy means moving with intention, not shrinking when things get hard, not letting temporary emotions dictate standards.
+- Business exposes identity. Whether he finishes what he starts, avoids hard conversations, drops balls under pressure, or acts like a closer vs. a drifter — call it out.
+
+WHEN HE'S BEHIND OR AVOIDING:
+Do not ask "how are you feeling about it." Ask "what's the next move and when are you doing it." Hold him to what he said he would do. If he made commitments to leads or clients, surface them. If he's behind on prospecting, do not let it slide — the pipeline is his lifeline.
+
+The two versions of Michael are always present:
+Version 1 — Reactive, scattered, pulled by every idea and emotion, waiting to feel "on."
+Version 2 — Calm, sharp, decisive, focused, reliable, building something real.
+Your job is to make Version 2 the default by demanding his behavior match it right now, not when conditions improve.
+
+WHEN MICHAEL VOICE-DUMPS A PROSPECT INTERACTION, respond with coaching first (what he did well, what to sharpen, the next move), then append JSON:
 \`\`\`json
 {
   "extractedLead": {
@@ -225,11 +347,11 @@ Only include JSON when lead data exists. Use "updateExisting": true if updating 
 
 STATE (${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}):
 Sales Pipeline: ${salesLeads.length} active
-${leadSummaries || "Empty. Push Michael."}
-Overdue (3+ days): ${overdueSummaries || "None"}
-Prospecting: ${todayLog.length}/${target} ${todayLog.length < target ? `(BEHIND by ${target - todayLog.length})` : "(HIT)"}
-Tasks: ${openTasks || "None"}
-RULES: Push if behind on prospecting. Mention overdue leads. Keep it SHORT.`;
+${leadSummaries || "Empty pipeline. No leads means no revenue. This is the priority."}
+Overdue (3+ days): ${overdueSummaries || "None — keep it that way."}
+Prospecting: ${todayLog.length}/${target} ${todayLog.length < target ? `(BEHIND by ${target - todayLog.length}. No excuses. What's the next prospect?)` : "(HIT — good. Now close something.)"}
+Tasks: ${openTasks || "None open — are you sure nothing's slipping?"}
+RULES: If behind on prospecting, lead with that — it's non-negotiable. Surface overdue leads and unfinished commitments. Push completion over new starts. Keep responses SHORT and actionable. Every response must end with a clear next move.`;
 }
 
 // ============================================
@@ -591,6 +713,7 @@ function ColdCallStation({ state, setState }) {
     const newLog = [
       ...state.prospectingLog,
       {
+        id: uid(),
         date: today(),
         type: "Cold Call",
         timestamp: new Date().toISOString(),
@@ -1145,24 +1268,131 @@ function TaskList({ tasks, onToggle, onDelete }) {
 // MAIN APP
 // ============================================
 export default function Home() {
+  // Auth state
+  const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // App state
   const [state, setState] = useState(DEFAULT_STATE);
   const [hydrated, setHydrated] = useState(false);
+  const [syncReady, setSyncReady] = useState(false);
   const [tab, setTab] = useState("copilot");
   const [isProcessing, setIsProcessing] = useState(false);
   const [latestConvo, setLatestConvo] = useState(null);
   const [leadFilter, setLeadFilter] = useState("all");
   const [pipelineView, setPipelineView] = useState("sales");
   const [taskInput, setTaskInput] = useState("");
+  const [saveWarning, setSaveWarning] = useState(null);
+  const [loadWarning, setLoadWarning] = useState(null);
+  const [showDataPanel, setShowDataPanel] = useState(false);
+  const autoExportFired = useRef(false);
+  const fileInputRef = useRef(null);
+  const prevStateRef = useRef(null);
+  const syncFnRef = useRef(null);
 
-  // Hydrate from localStorage after mount (avoids SSR mismatch)
+  // Auth: check session on mount + listen for changes
   useEffect(() => {
-    setState(loadState());
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user || null);
+      setAuthLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user || null);
+    });
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const signIn = useCallback(async (email, password) => {
+    const result = await supabase.auth.signInWithPassword({ email, password });
+    return result;
+  }, []);
+
+  const signOut = useCallback(async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+    setSyncReady(false);
+  }, []);
+
+  // Phase 1: Hydrate from localStorage instantly (works offline)
+  useEffect(() => {
+    const { state: loaded, source, warning } = loadState();
+    setState(loaded);
+    if (warning) setLoadWarning(warning);
     setHydrated(true);
   }, []);
 
+  // Phase 2: Once authenticated, load from Supabase (source of truth)
   useEffect(() => {
-    if (hydrated) saveState(state);
+    if (!user || !hydrated) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const { state: cloudState, hasData } = await loadFromSupabase(supabase, user.id);
+        if (cancelled) return;
+
+        if (hasData && cloudState) {
+          setState(cloudState);
+          setLoadWarning(null);
+        } else {
+          // Supabase is empty — migrate localStorage data up
+          const { state: localState } = loadState();
+          const hasLocal = localState.leads.length > 0 || localState.tasks.length > 0 ||
+            localState.prospectingLog.length > 0 || localState.callLists.length > 0 ||
+            localState.aiConversations.length > 0;
+          if (hasLocal) {
+            const result = await migrateToSupabase(supabase, user.id, localState);
+            if (!result.ok) {
+              console.error("Migration errors:", result.errors);
+            }
+          }
+        }
+        setSyncReady(true);
+      } catch (err) {
+        console.error("Supabase load error:", err);
+        setSyncReady(true); // Still allow saving even if load failed
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [user, hydrated]);
+
+  // Save to localStorage on every state change (offline cache)
+  useEffect(() => {
+    if (!hydrated) return;
+    const result = saveState(state);
+    if (!result.ok) {
+      setSaveWarning(result.error);
+      if (!autoExportFired.current) {
+        autoExportFired.current = true;
+        exportAllData(state);
+      }
+    } else {
+      setSaveWarning(null);
+    }
   }, [state, hydrated]);
+
+  // Debounced sync to Supabase on every state change
+  useEffect(() => {
+    if (!syncReady || !user) return;
+    if (!syncFnRef.current) {
+      syncFnRef.current = createDebouncedSync(supabase, user.id);
+    }
+    syncFnRef.current(state, prevStateRef.current);
+    prevStateRef.current = state;
+  }, [state, syncReady, user]);
+
+  // Reconnect sync: push state when coming back online
+  useEffect(() => {
+    if (!syncReady || !user) return;
+    const handleOnline = () => {
+      if (syncFnRef.current) {
+        syncFnRef.current(state, null); // null prevState triggers full sync
+      }
+    };
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
+  }, [syncReady, user, state]);
 
   useEffect(() => {
     const h = (e) =>
@@ -1170,7 +1400,7 @@ export default function Home() {
         ...p,
         prospectingLog: [
           ...p.prospectingLog,
-          { date: today(), type: e.detail.type, timestamp: new Date().toISOString() },
+          { id: uid(), date: today(), type: e.detail.type, timestamp: new Date().toISOString() },
         ],
       }));
     window.addEventListener("tmb-log", h);
@@ -1281,6 +1511,7 @@ export default function Home() {
 
       if (extractedData?.prospectingActivity) {
         np.push({
+          id: uid(),
           date: today(),
           type: extractedData.prospectingActivity.type,
           timestamp: new Date().toISOString(),
@@ -1323,12 +1554,16 @@ export default function Home() {
       ),
     }));
 
-  if (!hydrated) {
+  if (authLoading || !hydrated) {
     return (
       <div style={{ background: C.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
         <div style={{ color: C.textMuted, fontSize: 16 }}>Loading...</div>
       </div>
     );
+  }
+
+  if (!user) {
+    return <LoginScreen onSignIn={signIn} />;
   }
 
   const salesLeads = state.leads.filter((l) => l.pipeline === "sales" || !l.pipeline);
@@ -1364,22 +1599,38 @@ export default function Home() {
               {new Date().toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })}
             </div>
           </div>
-          <div
-            style={{
-              background: todayPros >= target ? C.greenLight : todayPros > 0 ? C.amberLight : C.redLight,
-              padding: "5px 12px",
-              borderRadius: 8,
-            }}
-          >
-            <span
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button
+              onClick={() => setShowDataPanel((p) => !p)}
               style={{
-                fontSize: 16,
-                fontWeight: 800,
-                color: todayPros >= target ? C.green : todayPros > 0 ? "#B7791F" : C.red,
+                background: "transparent",
+                border: "none",
+                cursor: "pointer",
+                fontSize: 18,
+                color: C.textMuted,
+                padding: 4,
+              }}
+              title="Data Management"
+            >
+              &#9881;
+            </button>
+            <div
+              style={{
+                background: todayPros >= target ? C.greenLight : todayPros > 0 ? C.amberLight : C.redLight,
+                padding: "5px 12px",
+                borderRadius: 8,
               }}
             >
-              {todayPros}/{target}
-            </span>
+              <span
+                style={{
+                  fontSize: 16,
+                  fontWeight: 800,
+                  color: todayPros >= target ? C.green : todayPros > 0 ? "#B7791F" : C.red,
+                }}
+              >
+                {todayPros}/{target}
+              </span>
+            </div>
           </div>
         </div>
         <div style={{ display: "flex" }}>
@@ -1418,6 +1669,79 @@ export default function Home() {
           ))}
         </div>
       </div>
+
+      {/* Warnings */}
+      {loadWarning && (
+        <div style={{ margin: "10px 14px 0", padding: "10px 14px", background: C.amberLight, borderRadius: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, color: "#92400E", fontWeight: 600 }}>{loadWarning}</span>
+          <button onClick={() => setLoadWarning(null)} style={{ background: "transparent", border: "none", cursor: "pointer", color: "#92400E", fontWeight: 800, fontSize: 16 }}>&times;</button>
+        </div>
+      )}
+      {saveWarning && (
+        <div style={{ margin: "10px 14px 0", padding: "10px 14px", background: C.redLight, borderRadius: 8 }}>
+          <div style={{ fontSize: 13, color: "#991B1B", fontWeight: 700, marginBottom: 6 }}>WARNING: Data cannot be saved — storage may be full.</div>
+          <div style={{ fontSize: 12, color: "#991B1B" }}>{saveWarning}</div>
+          <button onClick={() => exportAllData(state)} style={{ marginTop: 8, background: C.red, color: "#fff", border: "none", borderRadius: 6, padding: "6px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Export Data Now</button>
+        </div>
+      )}
+
+      {/* Data Management Panel */}
+      {showDataPanel && (
+        <div style={{ margin: "10px 14px 0", padding: 16, background: C.card, borderRadius: 10, border: "1px solid #E8ECF0" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ fontSize: 14, fontWeight: 800, color: C.text }}>Data Management</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 11, color: C.green, fontWeight: 600 }}>{syncReady ? "Synced" : "Syncing..."}</span>
+              <button
+                onClick={signOut}
+                style={{ background: C.redLight, color: C.red, border: "none", borderRadius: 6, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+              >
+                Sign Out
+              </button>
+            </div>
+          </div>
+          <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 12 }}>
+            Storage: {typeof window !== "undefined" ? (JSON.stringify(state).length / 1024).toFixed(1) : "—"} KB &middot; Version {DATA_VERSION} &middot; Cloud sync {syncReady ? "active" : "connecting..."}
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              onClick={() => exportAllData(state)}
+              style={{ background: C.green, color: "#fff", border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+            >
+              Export All Data
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              style={{ background: C.blue, color: "#fff", border: "none", borderRadius: 6, padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+            >
+              Import Data
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              style={{ display: "none" }}
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                if (!file) return;
+                if (!confirm("This will replace all current data with the imported backup. Continue?")) {
+                  e.target.value = "";
+                  return;
+                }
+                try {
+                  const imported = await importAllData(file);
+                  setState(imported);
+                  setShowDataPanel(false);
+                  alert("Data restored successfully!");
+                } catch (err) {
+                  alert("Import failed: " + err.message);
+                }
+                e.target.value = "";
+              }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Content */}
       <div style={{ padding: "14px 14px" }}>
