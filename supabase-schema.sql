@@ -183,3 +183,35 @@ create trigger prospecting_log_updated before update on prospecting_log for each
 create trigger call_lists_updated before update on call_lists for each row execute function update_updated_at();
 create trigger ai_conversations_updated before update on ai_conversations for each row execute function update_updated_at();
 create trigger settings_updated before update on settings for each row execute function update_updated_at();
+
+-- ==================
+-- V1 PROSPECTING TAB MIGRATIONS
+-- Run these in Supabase SQL Editor to extend existing tables.
+-- All additive (IF NOT EXISTS) — safe to run on existing data.
+-- ==================
+
+-- Prospect list metadata (niche switcher)
+alter table call_lists add column if not exists niche text;
+alter table call_lists add column if not exists emoji text;
+alter table call_lists add column if not exists notes text;
+alter table call_lists add column if not exists last_cursor jsonb;
+alter table call_lists add column if not exists archived_at timestamptz;
+
+-- Per-touch notes on prospecting log entries
+alter table prospecting_log add column if not exists notes text not null default '';
+
+-- ==================
+-- PHASE 2: business_profile TABLE
+-- Uncomment when ready to ship auto-learn business context.
+-- ==================
+-- create table if not exists business_profile (
+--   user_id uuid primary key references auth.users(id),
+--   summary text not null default '',
+--   facts jsonb not null default '[]',
+--   updated_at timestamptz not null default now()
+-- );
+-- alter table business_profile enable row level security;
+-- create policy "users_own_business_profile" on business_profile
+--   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+-- create trigger business_profile_updated before update on business_profile
+--   for each row execute function update_updated_at();

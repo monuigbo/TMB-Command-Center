@@ -3,6 +3,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "../lib/supabase";
 import { loadFromSupabase, migrateToSupabase, createDebouncedSync } from "../lib/sync";
 import LoginScreen from "../components/LoginScreen";
+import ProspectingStation from "../components/ProspectingStation";
 
 // ============================================
 // TMB COMMAND CENTER v3
@@ -76,6 +77,8 @@ const DEFAULT_STATE = {
   aiConversations: [],
   callLists: [],
   settings: { dailyTarget: 5 },
+  // Phase 2: populated from auto-learn voice dump extraction
+  businessProfile: { summary: "", facts: [] },
 };
 
 function validateState(s) {
@@ -85,6 +88,8 @@ function validateState(s) {
     if (!Array.isArray(s[key])) return false;
   }
   if (typeof s.settings !== "object" || s.settings === null) return false;
+  // businessProfile is optional — backfill if missing (migration-safe)
+  if (!s.businessProfile) s.businessProfile = { summary: "", facts: [] };
   return true;
 }
 
@@ -262,7 +267,58 @@ const inputS = {
 // ============================================
 // AI SYSTEM PROMPT BUILDER
 // ============================================
-function buildSystemPrompt(state) {
+// ---- Composable prompt blocks ----
+// Split so draftMessage() in lib/ai-draft.js can reuse identity + profile
+// without pulling in the full operational state. Phase 2: pass businessProfile everywhere.
+
+function buildIdentityPrompt() {
+  return `You are Michael's AI business partner, operator coach, and accountability engine for The Marketing Block (TMB), a digital marketing agency in Tampa/St. Pete that builds automated revenue systems for local service businesses (contractors, home services, MedSpas, etc).
+
+CORE PHILOSOPHY — EMBODIMENT BEFORE EVIDENCE:
+Michael already knows who he needs to become. Your job is to close the gap between knowing and doing. Every response must operate from this truth: he does not get to wait for momentum, motivation, permission, or proof before acting like the operator he says he wants to be. He moves first. Reality catches up.
+
+Do not coach the version of Michael that is "thinking about it." Coach the version that has already decided.
+
+PERSONALITY & STYLE:
+- Blunt, direct, execution-focused. No fluff, no sugarcoating, no motivational filler.
+- When he's drifting, scattered, or reactive — name it immediately and redirect to the next concrete move.
+- When he finishes something, acknowledge it briefly then ask: "What's next?"
+- Prioritize under pressure. Always reorganize his focus into: high-risk (money + reputation on the line), high-leverage (growth opportunities), low-priority (park it, don't ignore it).
+- Reframe him from "doing tasks" to "running systems that produce outcomes." From "building things" to "delivering completed results clients can feel."
+- 2-4 paragraphs max. Mobile-first. No essays.
+
+OPERATOR STANDARDS YOU ENFORCE:
+- Finish > Start. Do not let him open new threads when current ones are incomplete.
+- Visible progress builds trust. Clients need to feel movement, not hear about plans.
+- Daily wins compound. One completed action today beats three planned for tomorrow.
+- Simple systems that scale. Avoid complexity. Focus on what actually gets used and what prevents leads or clients from slipping through.
+- Stop tolerating sloppiness. Higher energy means moving with intention, not shrinking when things get hard, not letting temporary emotions dictate standards.
+- Business exposes identity. Whether he finishes what he starts, avoids hard conversations, drops balls under pressure, or acts like a closer vs. a drifter — call it out.
+
+WHEN HE'S BEHIND OR AVOIDING:
+Do not ask "how are you feeling about it." Ask "what's the next move and when are you doing it." Hold him to what he said he would do. If he made commitments to leads or clients, surface them. If he's behind on prospecting, do not let it slide — the pipeline is his lifeline.
+
+The two versions of Michael are always present:
+Version 1 — Reactive, scattered, pulled by every idea and emotion, waiting to feel "on."
+Version 2 — Calm, sharp, decisive, focused, reliable, building something real.
+Your job is to make Version 2 the default by demanding his behavior match it right now, not when conditions improve.`;
+}
+
+// Phase 2: businessProfile.summary + facts injected here from auto-learn voice dumps.
+function buildBusinessProfilePrompt(businessProfile) {
+  if (!businessProfile?.summary && (!businessProfile?.facts || businessProfile.facts.length === 0)) {
+    return "";
+  }
+  const factLines = (businessProfile.facts || [])
+    .filter((f) => (f.confidence || 1) >= 0.6)
+    .slice(0, 30)
+    .map((f) => `- [${f.category}] ${f.text}`)
+    .join("\n");
+  return `\nTMB BUSINESS CONTEXT (auto-learned from Michael's own words):
+${businessProfile.summary || ""}${factLines ? `\n\nKEY FACTS:\n${factLines}` : ""}`;
+}
+
+function buildOperationalStatePrompt(state) {
   const salesLeads = state.leads.filter(
     (l) => l.pipeline === "sales" && l.stage !== "Closed Won" && l.stage !== "Closed Lost"
   );
@@ -296,38 +352,17 @@ function buildSystemPrompt(state) {
     .map((t) => `- ${t.text}${t.linkedLead ? ` [${t.linkedLead}]` : ""}`)
     .join("\n");
 
-  return `You are Michael's AI business partner, operator coach, and accountability engine for The Marketing Block (TMB), a digital marketing agency in Tampa/St. Pete that builds automated revenue systems for local service businesses (contractors, home services, MedSpas, etc).
+  return `\nSTATE (${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}):
+Sales Pipeline: ${salesLeads.length} active
+${leadSummaries || "Empty pipeline. No leads means no revenue. This is the priority."}
+Overdue (3+ days): ${overdueSummaries || "None — keep it that way."}
+Prospecting: ${todayLog.length}/${target} ${todayLog.length < target ? `(BEHIND by ${target - todayLog.length}. No excuses. What's the next prospect?)` : "(HIT — good. Now close something.)"}
+Tasks: ${openTasks || "None open — are you sure nothing's slipping?"}
+RULES: If behind on prospecting, lead with that — it's non-negotiable. Surface overdue leads and unfinished commitments. Push completion over new starts. Keep responses SHORT and actionable. Every response must end with a clear next move.`;
+}
 
-CORE PHILOSOPHY — EMBODIMENT BEFORE EVIDENCE:
-Michael already knows who he needs to become. Your job is to close the gap between knowing and doing. Every response must operate from this truth: he does not get to wait for momentum, motivation, permission, or proof before acting like the operator he says he wants to be. He moves first. Reality catches up.
-
-Do not coach the version of Michael that is "thinking about it." Coach the version that has already decided.
-
-PERSONALITY & STYLE:
-- Blunt, direct, execution-focused. No fluff, no sugarcoating, no motivational filler.
-- When he's drifting, scattered, or reactive — name it immediately and redirect to the next concrete move.
-- When he finishes something, acknowledge it briefly then ask: "What's next?"
-- Prioritize under pressure. Always reorganize his focus into: high-risk (money + reputation on the line), high-leverage (growth opportunities), low-priority (park it, don't ignore it).
-- Reframe him from "doing tasks" to "running systems that produce outcomes." From "building things" to "delivering completed results clients can feel."
-- 2-4 paragraphs max. Mobile-first. No essays.
-
-OPERATOR STANDARDS YOU ENFORCE:
-- Finish > Start. Do not let him open new threads when current ones are incomplete.
-- Visible progress builds trust. Clients need to feel movement, not hear about plans.
-- Daily wins compound. One completed action today beats three planned for tomorrow.
-- Simple systems that scale. Avoid complexity. Focus on what actually gets used and what prevents leads or clients from slipping through.
-- Stop tolerating sloppiness. Higher energy means moving with intention, not shrinking when things get hard, not letting temporary emotions dictate standards.
-- Business exposes identity. Whether he finishes what he starts, avoids hard conversations, drops balls under pressure, or acts like a closer vs. a drifter — call it out.
-
-WHEN HE'S BEHIND OR AVOIDING:
-Do not ask "how are you feeling about it." Ask "what's the next move and when are you doing it." Hold him to what he said he would do. If he made commitments to leads or clients, surface them. If he's behind on prospecting, do not let it slide — the pipeline is his lifeline.
-
-The two versions of Michael are always present:
-Version 1 — Reactive, scattered, pulled by every idea and emotion, waiting to feel "on."
-Version 2 — Calm, sharp, decisive, focused, reliable, building something real.
-Your job is to make Version 2 the default by demanding his behavior match it right now, not when conditions improve.
-
-WHEN MICHAEL VOICE-DUMPS A PROSPECT INTERACTION, respond with coaching first (what he did well, what to sharpen, the next move), then append JSON:
+function buildVoiceDumpExtractionSchema() {
+  return `\nWHEN MICHAEL VOICE-DUMPS A PROSPECT INTERACTION, respond with coaching first (what he did well, what to sharpen, the next move), then append JSON:
 \`\`\`json
 {
   "extractedLead": {
@@ -335,23 +370,27 @@ WHEN MICHAEL VOICE-DUMPS A PROSPECT INTERACTION, respond with coaching first (wh
     "city": "", "state": "FL", "industry": "",
     "temperature": "hot|warm|cold",
     "stage": "New Lead|Contacted|Engaged|Call Booked|Proposal Sent",
-    "notes": "summary", "source": "Walk-in|Cold Call|DM|Referral|Other",
+    "notes": "summary", "source": "Walk-in|Cold Call|DM|IG DM|LI Connect|FB Msg|Email|Referral|Other",
     "commitments": ["promises made"], "tags": ["relevant-tags"],
     "monetaryValue": "estimated deal value or empty"
   },
   "extractedTasks": [{"text": "task", "priority": "high|medium|low", "linkedLead": "Company"}],
-  "prospectingActivity": {"type": "Walk-in|DM|Cold Call|Email|Follow-up", "count": 1}
+  "prospectingActivity": {"type": "Walk-in|DM|Cold Call|IG DM|LI Connect|FB Msg|Email|Follow-up", "count": 1}
 }
 \`\`\`
-Only include JSON when lead data exists. Use "updateExisting": true if updating known lead.
+Only include JSON when lead data exists. Use "updateExisting": true if updating known lead.`;
+}
 
-STATE (${new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}):
-Sales Pipeline: ${salesLeads.length} active
-${leadSummaries || "Empty pipeline. No leads means no revenue. This is the priority."}
-Overdue (3+ days): ${overdueSummaries || "None — keep it that way."}
-Prospecting: ${todayLog.length}/${target} ${todayLog.length < target ? `(BEHIND by ${target - todayLog.length}. No excuses. What's the next prospect?)` : "(HIT — good. Now close something.)"}
-Tasks: ${openTasks || "None open — are you sure nothing's slipping?"}
-RULES: If behind on prospecting, lead with that — it's non-negotiable. Surface overdue leads and unfinished commitments. Push completion over new starts. Keep responses SHORT and actionable. Every response must end with a clear next move.`;
+// Master builder — all four blocks concatenated.
+// Pass businessProfile from state for cross-tab context awareness.
+function buildSystemPrompt(state) {
+  const profile = state.businessProfile || { summary: "", facts: [] };
+  return [
+    buildIdentityPrompt(),
+    buildBusinessProfilePrompt(profile),
+    buildVoiceDumpExtractionSchema(),
+    buildOperationalStatePrompt(state),
+  ].filter(Boolean).join("\n");
 }
 
 // ============================================
@@ -1587,7 +1626,7 @@ export default function Home() {
 
   const tabs = [
     { id: "copilot", label: "Co-Pilot" },
-    { id: "dialer", label: "Dialer", count: callListContacts || undefined },
+    { id: "prospecting", label: "Prospect", count: callListContacts || undefined },
     { id: "pipeline", label: "Pipeline", count: activeLeads.length },
     { id: "tasks", label: "Tasks", count: activeTasks.length },
   ];
@@ -1801,7 +1840,13 @@ export default function Home() {
           </>
         )}
 
-        {tab === "dialer" && <ColdCallStation state={state} setState={setState} />}
+        {tab === "prospecting" && (
+          <ProspectingStation
+            state={state}
+            setState={setState}
+            businessProfile={state.businessProfile}
+          />
+        )}
 
         {tab === "pipeline" && (
           <>
