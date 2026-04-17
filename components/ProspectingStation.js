@@ -49,18 +49,50 @@ const INDUSTRIES = [
 // ---- Import flow ----
 function ImportFlow({ onImport, onCancel }) {
   const [csvText, setCsvText] = useState("");
+  const [sheetUrl, setSheetUrl] = useState("");
+  const [source, setSource] = useState("sheet"); // "sheet" | "paste"
   const [listName, setListName] = useState("");
   const [niche, setNiche] = useState("Contractor");
   const [emoji, setEmoji] = useState("");
   const [listNotes, setListNotes] = useState("");
   const [step, setStep] = useState("form"); // "form" | "confirm"
   const [parsed, setParsed] = useState(null);
+  const [fetching, setFetching] = useState(false);
+  const [fetchError, setFetchError] = useState("");
 
-  const handleParse = () => {
-    if (!csvText.trim() || !listName.trim()) return;
-    const result = parseCsv(csvText);
-    setParsed(result);
-    setStep("confirm");
+  const handleParse = async () => {
+    if (!listName.trim()) return;
+    setFetchError("");
+
+    if (source === "paste") {
+      if (!csvText.trim()) return;
+      setParsed(parseCsv(csvText));
+      setStep("confirm");
+      return;
+    }
+
+    // source === "sheet"
+    if (!sheetUrl.trim()) return;
+    setFetching(true);
+    try {
+      const res = await fetch("/api/fetch-sheet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: sheetUrl.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setFetchError(data.error || "Failed to fetch sheet.");
+        setFetching(false);
+        return;
+      }
+      setParsed(parseCsv(data.csv));
+      setStep("confirm");
+    } catch (e) {
+      setFetchError("Network error — check your connection and try again.");
+    } finally {
+      setFetching(false);
+    }
   };
 
   const handleConfirm = () => {
@@ -140,21 +172,70 @@ function ImportFlow({ onImport, onCancel }) {
         <input value={emoji} onChange={(e) => setEmoji(e.target.value)} placeholder="🔧" maxLength={2} style={{ ...inputS, width: 60, textAlign: "center", fontSize: 20 }} />
       </div>
 
-      <input value={listNotes} onChange={(e) => setListNotes(e.target.value)} placeholder="Notes about this list (optional)" style={{ ...inputS, marginBottom: 8 }} />
+      <input value={listNotes} onChange={(e) => setListNotes(e.target.value)} placeholder="Notes about this list (optional)" style={{ ...inputS, marginBottom: 12 }} />
 
-      <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>
-        Paste CSV — first row = headers (business_name, instagram, linkedin, phone, email, city, industry, etc.)
+      {/* Source tabs */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, background: "#F0F2F5", borderRadius: 10, padding: 4 }}>
+        {[
+          { id: "sheet", label: "Google Sheets URL" },
+          { id: "paste", label: "Paste CSV" },
+        ].map((tab) => (
+          <button
+            key={tab.id}
+            onClick={() => { setSource(tab.id); setFetchError(""); }}
+            style={{
+              flex: 1, padding: "8px 10px", borderRadius: 8, border: "none", cursor: "pointer",
+              fontSize: 12, fontWeight: 700,
+              background: source === tab.id ? "#fff" : "transparent",
+              color: source === tab.id ? C.text : C.textMuted,
+              boxShadow: source === tab.id ? "0 1px 3px rgba(0,0,0,0.08)" : "none",
+            }}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
-      <textarea
-        value={csvText} onChange={(e) => setCsvText(e.target.value)} rows={5}
-        placeholder={"Business Name,Instagram,Phone,Email\nABC Plumbing,@abcplumbing,8135550101,mike@abc.com"}
-        style={{ ...inputS, fontFamily: "monospace", fontSize: 12, resize: "vertical", marginBottom: 8 }}
-      />
+
+      {source === "sheet" ? (
+        <>
+          <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>
+            Paste a Google Sheets link. Set sharing to <strong>"Anyone with the link — Viewer"</strong> first.
+          </div>
+          <input
+            value={sheetUrl}
+            onChange={(e) => { setSheetUrl(e.target.value); setFetchError(""); }}
+            placeholder="https://docs.google.com/spreadsheets/d/..."
+            style={{ ...inputS, fontSize: 13, marginBottom: 8 }}
+          />
+          {fetchError && (
+            <div style={{ background: C.redLight, color: C.red, padding: "8px 12px", borderRadius: 8, fontSize: 12, marginBottom: 8 }}>
+              {fetchError}
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          <div style={{ fontSize: 12, color: C.textMuted, marginBottom: 6 }}>
+            Paste CSV — first row = headers (business_name, instagram, linkedin, phone, email, city, industry, etc.)
+          </div>
+          <textarea
+            value={csvText} onChange={(e) => setCsvText(e.target.value)} rows={5}
+            placeholder={"Business Name,Instagram,Phone,Email\nABC Plumbing,@abcplumbing,8135550101,mike@abc.com"}
+            style={{ ...inputS, fontFamily: "monospace", fontSize: 12, resize: "vertical", marginBottom: 8 }}
+          />
+        </>
+      )}
 
       <div style={{ display: "flex", gap: 8 }}>
-        <button onClick={handleParse} disabled={!csvText.trim() || !listName.trim()}
-          style={{ background: C.green, color: "#fff", border: "none", borderRadius: 10, padding: "10px 22px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>
-          Preview →
+        <button
+          onClick={handleParse}
+          disabled={fetching || !listName.trim() || (source === "sheet" ? !sheetUrl.trim() : !csvText.trim())}
+          style={{
+            background: C.green, color: "#fff", border: "none", borderRadius: 10,
+            padding: "10px 22px", fontSize: 14, fontWeight: 700,
+            cursor: fetching ? "wait" : "pointer", opacity: fetching ? 0.7 : 1,
+          }}>
+          {fetching ? "Fetching…" : "Preview →"}
         </button>
         <button onClick={onCancel} style={{ background: "none", border: "none", color: C.textMuted, fontSize: 13, cursor: "pointer" }}>
           Cancel
