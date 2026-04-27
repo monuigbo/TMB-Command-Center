@@ -367,6 +367,8 @@ export default function ProspectingStation({ state, setState, businessProfile = 
   });
   const [inSession, setInSession] = useState(false);
   const [openChannel, setOpenChannel] = useState(null);
+  const [navHistory, setNavHistory] = useState([]);
+  const [channelFilter, setChannelFilter] = useState(null);
   const [showImport, setShowImport] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
   const [showManage, setShowManage] = useState(false);
@@ -374,7 +376,8 @@ export default function ProspectingStation({ state, setState, businessProfile = 
   const activeList = lists.find((l) => l.id === activeListId) || null;
 
   // Resolve current contact from lastCursor or first pending
-  const pendingContacts = activeList?.contacts.filter((c) => c.status === "pending") || [];
+  const pendingContacts = (activeList?.contacts.filter((c) => c.status === "pending") || [])
+    .filter((c) => !channelFilter || detectChannelsAvailable(c).includes(channelFilter));
   const cursorContactId = activeList?.lastCursor?.contactId;
   const cursorChannel = activeList?.lastCursor?.channel || "phone";
   const currentContact = cursorContactId
@@ -392,14 +395,17 @@ export default function ProspectingStation({ state, setState, businessProfile = 
     }));
   };
 
-  // Save cursor when channel opens
+  // Save cursor when channel opens; auto-open filtered channel for each card
   useEffect(() => {
     if (!inSession || !activeListId || !currentContact) return;
+    if (channelFilter && !openChannel) {
+      setOpenChannel(channelFilter);
+    }
     updateList(activeListId, (l) => ({
       ...l,
       lastCursor: { contactId: currentContact.id, channel: openChannel || cursorChannel },
     }));
-  }, [openChannel, currentContact?.id, inSession]);
+  }, [openChannel, currentContact?.id, inSession, channelFilter]);
 
   const handleImport = (newList) => {
     setState((prev) => ({ ...prev, callLists: [...prev.callLists, newList] }));
@@ -467,10 +473,12 @@ export default function ProspectingStation({ state, setState, businessProfile = 
     }));
 
     setOpenChannel(null);
+    setNavHistory([]);
   };
 
   const handleSkip = () => {
     if (!currentContact || !activeList) return;
+    setNavHistory((h) => [...h, currentContact.id]);
     const idx = pendingContacts.indexOf(currentContact);
     const next = pendingContacts[idx + 1] || null;
     updateList(activeListId, (l) => ({
@@ -482,12 +490,24 @@ export default function ProspectingStation({ state, setState, businessProfile = 
 
   const handleNext = () => {
     if (!currentContact || !activeList) return;
-    // Move current contact to end of pending (re-queue)
+    setNavHistory((h) => [...h, currentContact.id]);
     const idx = pendingContacts.indexOf(currentContact);
     const next = pendingContacts[idx + 1] || null;
     updateList(activeListId, (l) => ({
       ...l,
       lastCursor: next ? { contactId: next.id, channel: null } : null,
+    }));
+    setOpenChannel(null);
+  };
+
+  const handleBack = () => {
+    if (navHistory.length === 0) return;
+    const newHistory = [...navHistory];
+    const poppedId = newHistory.pop();
+    setNavHistory(newHistory);
+    updateList(activeListId, (l) => ({
+      ...l,
+      lastCursor: { contactId: poppedId, channel: null },
     }));
     setOpenChannel(null);
   };
@@ -626,7 +646,7 @@ export default function ProspectingStation({ state, setState, businessProfile = 
           <ListPicker
             lists={lists}
             activeListId={activeListId}
-            onSelect={(id) => { setActiveListId(id); setOpenChannel(null); }}
+            onSelect={(id) => { setActiveListId(id); setOpenChannel(null); setNavHistory([]); setChannelFilter(null); }}
             onClose={() => setShowPicker(false)}
           />
         )}
@@ -636,8 +656,11 @@ export default function ProspectingStation({ state, setState, businessProfile = 
 
   // View: active prospecting session
   const availableChannels = currentContact ? detectChannelsAvailable(currentContact) : [];
-  const pending = activeList?.contacts.filter((c) => c.status === "pending").length || 0;
-  const total = activeList?.contacts.length || 0;
+  const filteredContacts = activeList?.contacts.filter((c) =>
+    !channelFilter || detectChannelsAvailable(c).includes(channelFilter)
+  ) || [];
+  const total = filteredContacts.length;
+  const pending = filteredContacts.filter((c) => c.status === "pending").length;
   const touched = total - pending;
 
   return (
@@ -653,11 +676,33 @@ export default function ProspectingStation({ state, setState, businessProfile = 
             <div style={{ fontSize: 11, color: C.textMuted }}>{touched}/{total} touched · {pending} left · tap to switch</div>
           </button>
           <button
-            onClick={() => setInSession(false)}
+            onClick={() => { setInSession(false); setNavHistory([]); setChannelFilter(null); }}
             style={{ background: "#fff", color: C.red, border: `1.5px solid ${C.red}30`, borderRadius: 8, padding: "6px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
             End
           </button>
         </div>
+      </div>
+
+      {/* Channel filter chips */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+        {[{ id: null, label: "All", icon: null }, ...ENABLED_CHANNELS.map((id) => ({ id, label: CHANNELS[id].label, icon: CHANNELS[id].icon }))].map(({ id, label, icon }) => {
+          const isActive = channelFilter === id;
+          const ch = id ? CHANNELS[id] : null;
+          return (
+            <button
+              key={id ?? "all"}
+              onClick={() => { setChannelFilter(id); setNavHistory([]); }}
+              style={{
+                padding: "5px 12px", borderRadius: 20, border: "none", cursor: "pointer",
+                fontSize: 12, fontWeight: 600,
+                background: isActive ? (ch?.bg || C.greenLight) : "#F7F8FA",
+                color: isActive ? (ch?.color || C.greenDark) : "#9DAAB7",
+              }}
+            >
+              {icon ? `${icon} ${label}` : label}
+            </button>
+          );
+        })}
       </div>
 
       {currentContact ? (
@@ -703,8 +748,12 @@ export default function ProspectingStation({ state, setState, businessProfile = 
               ))}
             </div>
 
-            {/* Skip / Next footer */}
+            {/* Back / Skip / Next footer */}
             <div style={{ display: "flex", gap: 8, padding: "0 16px 16px" }}>
+              <button onClick={handleBack} disabled={navHistory.length === 0}
+                style={{ flex: 1, background: "#F7F8FA", color: navHistory.length === 0 ? "#C8CDD2" : C.textMuted, border: "1px solid #E2E6EA", borderRadius: 10, padding: "11px", fontSize: 13, fontWeight: 600, cursor: navHistory.length === 0 ? "default" : "pointer" }}>
+                ← Back
+              </button>
               <button onClick={handleSkip}
                 style={{ flex: 1, background: "#F7F8FA", color: C.textMuted, border: "1px solid #E2E6EA", borderRadius: 10, padding: "11px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
                 Skip
@@ -718,14 +767,26 @@ export default function ProspectingStation({ state, setState, businessProfile = 
         </>
       ) : (
         <div style={{ ...cardS, textAlign: "center", padding: 40 }}>
-          <div style={{ fontSize: 28, fontWeight: 800, color: C.green, marginBottom: 8 }}>List Complete! 🎉</div>
-          <div style={{ color: C.textSecondary, marginBottom: 16 }}>
-            {touched} contacts touched today
-          </div>
-          <button onClick={() => setInSession(false)}
-            style={{ background: C.green, color: "#fff", border: "none", borderRadius: 12, padding: "12px 28px", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
-            Done
-          </button>
+          {channelFilter ? (
+            <>
+              <div style={{ fontSize: 20, fontWeight: 800, color: C.textSecondary, marginBottom: 8 }}>No contacts left for this filter</div>
+              <button onClick={() => setChannelFilter(null)}
+                style={{ background: C.blue, color: "#fff", border: "none", borderRadius: 12, padding: "12px 28px", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+                Clear filter
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 28, fontWeight: 800, color: C.green, marginBottom: 8 }}>List Complete! 🎉</div>
+              <div style={{ color: C.textSecondary, marginBottom: 16 }}>
+                {touched} contacts touched today
+              </div>
+              <button onClick={() => { setInSession(false); setNavHistory([]); setChannelFilter(null); }}
+                style={{ background: C.green, color: "#fff", border: "none", borderRadius: 12, padding: "12px 28px", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+                Done
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -733,7 +794,7 @@ export default function ProspectingStation({ state, setState, businessProfile = 
         <ListPicker
           lists={lists}
           activeListId={activeListId}
-          onSelect={(id) => { setActiveListId(id); setOpenChannel(null); }}
+          onSelect={(id) => { setActiveListId(id); setOpenChannel(null); setNavHistory([]); setChannelFilter(null); }}
           onClose={() => setShowPicker(false)}
         />
       )}
